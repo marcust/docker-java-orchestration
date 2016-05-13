@@ -1,19 +1,51 @@
 package com.alexecollins.docker.orchestration;
 
 
-import com.alexecollins.docker.orchestration.model.*;
+import com.alexecollins.docker.orchestration.model.BuildFlag;
+import com.alexecollins.docker.orchestration.model.CleanFlag;
+import com.alexecollins.docker.orchestration.model.Conf;
+import com.alexecollins.docker.orchestration.model.ContainerConf;
+import com.alexecollins.docker.orchestration.model.HealthChecks;
+import com.alexecollins.docker.orchestration.model.Id;
+import com.alexecollins.docker.orchestration.model.LogPattern;
+import com.alexecollins.docker.orchestration.model.Ping;
 import com.alexecollins.docker.orchestration.plugin.api.Plugin;
 import com.alexecollins.docker.orchestration.util.Pinger;
-import com.github.dockerjava.api.*;
-import com.github.dockerjava.api.command.*;
-import com.github.dockerjava.api.model.*;
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.DockerClientException;
+import com.github.dockerjava.api.DockerException;
+import com.github.dockerjava.api.InternalServerErrorException;
+import com.github.dockerjava.api.NotFoundException;
+import com.github.dockerjava.api.command.BuildImageCmd;
+import com.github.dockerjava.api.command.CreateContainerCmd;
+import com.github.dockerjava.api.command.CreateContainerResponse;
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.LogContainerCmd;
+import com.github.dockerjava.api.command.PushImageCmd;
+import com.github.dockerjava.api.model.AccessMode;
+import com.github.dockerjava.api.model.Bind;
+import com.github.dockerjava.api.model.BuildResponseItem;
+import com.github.dockerjava.api.model.Container;
+import com.github.dockerjava.api.model.ExposedPort;
+import com.github.dockerjava.api.model.Identifier;
+import com.github.dockerjava.api.model.Image;
+import com.github.dockerjava.api.model.InternetProtocol;
 import com.github.dockerjava.api.model.Link;
+import com.github.dockerjava.api.model.PortBinding;
+import com.github.dockerjava.api.model.Ports;
+import com.github.dockerjava.api.model.PushResponseItem;
+import com.github.dockerjava.api.model.Repository;
+import com.github.dockerjava.api.model.ResponseItem;
+import com.github.dockerjava.api.model.Volume;
+import com.github.dockerjava.api.model.VolumesFrom;
 import com.github.dockerjava.core.command.BuildImageResultCallback;
 import com.github.dockerjava.core.command.PushImageResultCallback;
 import com.google.common.base.Function;
 import com.google.common.base.Optional;
+import com.google.common.base.Throwables;
 import com.google.common.collect.FluentIterable;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Ordering;
 import com.google.common.collect.Sets;
 import org.apache.commons.compress.archivers.ArchiveException;
@@ -24,12 +56,31 @@ import org.apache.commons.io.IOUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
+import java.io.File;
+import java.io.FileFilter;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Map.Entry;
+import java.util.NoSuchElementException;
+import java.util.Properties;
+import java.util.ServiceLoader;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPOutputStream;
 
@@ -52,6 +103,7 @@ public class DockerOrchestrator {
     };
     private static final Logger DEFAULT_LOGGER = LoggerFactory.getLogger(DockerOrchestrator.class);
     private static final String CONTAINER_IP_PATTERN = "__CONTAINER.IP__";
+    private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
 
     private final Logger logger;
     private final DockerClient docker;
@@ -844,12 +896,53 @@ public class DockerOrchestrator {
     }
 
     public void start() {
+        final Map<Id, Future<?>> startingContainers = Maps.newHashMap();
+
         for (Id id : ids()) {
             if (!inclusive(id)) {
                 continue;
             }
-            start(id);
+
+            startAsync(startingContainers, id);
         }
+
+        for (final Future<?> future : startingContainers.values() ) {
+            try {
+                future.get();
+            } catch (Exception e) {
+                for (Throwable cause : Throwables.getCausalChain(e)) {
+                    if (cause instanceof OrchestrationException) {
+                        throw (OrchestrationException)cause;
+                    }
+                }
+
+                throw Throwables.propagate(e);
+            }
+        }
+    }
+
+    private void startAsync(final Map<Id, Future<?>> startingContainers, final Id id) {
+        final List<com.alexecollins.docker.orchestration.model.Link> links = repo.conf(id).getLinks();
+
+        for (final com.alexecollins.docker.orchestration.model.Link linkedContainer : links) {
+            final Id linkedId = linkedContainer.getId();
+            if (!startingContainers.containsKey(linkedId)) {
+                throw new RuntimeException(linkedId + " not starting!");
+            } else {
+                try {
+                    startingContainers.get(linkedId).get();
+                } catch (Exception e) {
+                    throw Throwables.propagate(e);
+                }
+            }
+        }
+
+        startingContainers.put(id, EXECUTOR.submit(new Runnable() {
+                                                       @Override
+                                                       public void run() {
+                                                           start(id);
+                                                       }
+                                                   }));
     }
 
     public void copy(String resource, String hostpath) {
